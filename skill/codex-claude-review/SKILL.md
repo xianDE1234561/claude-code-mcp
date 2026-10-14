@@ -20,7 +20,7 @@ Do not send the entire project by default. The bridge can skip sensitive paths, 
 ## Verify and fix
 
 1. Parse the MCP result's `structuredContent`, or JSON in its text content. `isError=true` means the review/diagnosis did not succeed; do not treat it as an empty finding list.
-2. Check `coverage.complete`, `coverage.skipped`, excerpt ranges and `freshness_verified`. `freshness.changed`, `freshness.unreadable` and `freshness.verification_timeout` distinguish source changes from unknown freshness. Recollect changed sources and resolve unreadable/timed-out verification before applying advice.
+2. Check `coverage.complete`, `coverage.skipped`, excerpt ranges, `chunks.complete`, `chunks.unreviewed` and `freshness_verified`. `freshness.changed`, `freshness.unreadable`, `freshness.verification_timeout` and `freshness.verification_cancelled` distinguish changes from unknown freshness. Recollect changed sources and resolve failed verification before applying advice. A successful tool response can contain a partial review: completed findings remain candidates and unreviewed ranges must be disclosed.
 3. Findings contain file/side, line range, evidence, source SHA-256, trigger, expected/actual behavior, an exact requirement/source-contract basis and verification steps. Confirm current hashes and inspect the citations. `location_verified` and `basis_verified` prove matching quotations; `verification_status=candidate` still requires host verification. Duplicate matching behaviors merge into `related_locations`.
 4. Reproduce or substantiate each candidate issue. Fix only confirmed issues within the authorized task. `suggestions` contains documentation/style/optional-test advice, separate from defects. Treat `hypotheses` and `tests_to_run` as suggestions, not executed tests or confirmed root causes.
 5. Run the relevant tests after fixes. One further Claude review may check changed areas. Default to at most two review calls per task, unless the user requests more or new evidence justifies additional work. Do not loop merely to reach model agreement.
@@ -30,9 +30,17 @@ Claude does not receive this chat automatically and cannot edit files through th
 
 The timeout is a total collection/model/verification budget (10–600 seconds). Progress notifications and `timing` show actual stages and elapsed time; they do not reset the deadline. Failures include `failed_phase`. The helper displays progress on stderr; `--quiet-progress` suppresses it. Client UI progress support can vary.
 
+V4 observes filtered CLI stream events: initialization, bounded API retry status/category, output activity and final-result presence. Raw text, thinking, session IDs and paths are never progress events. Activity does not mean a final report exists. `stream_events=false` uses legacy final JSON for compatible clients/providers. A persistent temporary-capture cleanup failure is explicitly flagged; it must not replace the original timeout.
+
+Default `chunked=true` reviews bounded module/file windows sequentially under one global deadline. `chunk_chars` is 6000–30000 (default 18000); `max_chunks` is 1–12 (default 12). Small source files and their named tests share a request when they fit. Check per-chunk `focuses`, request/stream metadata and pending ranges. Line windows on opposite diff sides may shift, and cross-chunk dependencies are not exhaustively covered. `chunked=false` keeps the previous single-request mode. Model calls per chunk count toward the task's usage; do not split small tasks needlessly.
+
+The packaged finite-contract benchmark distinguishes offline oracle checks from `quality_eval.py --live` model measurements. Four cases are an initial regression baseline, not a general accuracy claim. Live reports contain private local context and must remain local.
+
 Complete matching reviews and redacted source excerpts may be cached for five minutes within one server process. Sources are reread and hashed; cached reviews undergo freshness checks again. `request.cache_hit=true` and `model_called=false` identify reuse. Set `use_cache=false` to bypass both caches. Restarting the server clears them. Result JSON can contain private project paths, source quotations and logs: keep it local and exclude it from public uploads.
 
 ## If native MCP tools are not yet available
+
+Stream `transport_keepalive` means the connection is alive, not that the model produced output. Only recognized content delta/message types count as output activity; raw contents remain private.
 
 Prefer the registered MCP tools when present. For a newly updated service that the current chat has not loaded, the packaged helper can call the same registered server:
 

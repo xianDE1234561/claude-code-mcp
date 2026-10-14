@@ -10,7 +10,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest -v test_bridge.py test_workflow.py test_client.py test_utilities.py test_setup.py
+      - run: python -m unittest -v test_bridge.py test_workflow.py test_client.py test_utilities.py test_setup.py test_stream.py test_chunks.py test_quality.py
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+
+      - run: python quality_eval.py
         env:
           PYTHONUTF8: '1'
           PYTHONIOENCODING: utf-8

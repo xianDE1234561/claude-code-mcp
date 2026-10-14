@@ -18,11 +18,11 @@ LOCAL=threading.local()
 
 
 @contextmanager
-def call_budget(timeout,cancelled=None,use_cache=True):
-    previous=(getattr(LOCAL,'deadline',None),getattr(LOCAL,'cancelled',None),getattr(LOCAL,'use_cache',True))
-    LOCAL.deadline=time.monotonic()+timeout; LOCAL.cancelled=cancelled; LOCAL.use_cache=use_cache
+def call_budget(timeout,cancelled=None,use_cache=True,wide_context=False):
+    previous=(getattr(LOCAL,'deadline',None),getattr(LOCAL,'cancelled',None),getattr(LOCAL,'use_cache',True),getattr(LOCAL,'wide_context',False))
+    LOCAL.deadline=time.monotonic()+timeout; LOCAL.cancelled=cancelled; LOCAL.use_cache=use_cache; LOCAL.wide_context=wide_context
     try: yield
-    finally: LOCAL.deadline,LOCAL.cancelled,LOCAL.use_cache=previous
+    finally: LOCAL.deadline,LOCAL.cancelled,LOCAL.use_cache,LOCAL.wide_context=previous
 
 
 def budget_remaining(default=15):
@@ -150,11 +150,12 @@ def snapshot(project, relative, raw=None, side='after', focus=None, sanitizer=la
     raw=read_bytes(path) if raw is None else raw
     digest=hashlib.sha256(raw).hexdigest()
     redaction_key=getattr(sanitizer,'cache_key',None) if getattr(LOCAL,'use_cache',True) else None
-    key=(str(path),digest,side,json.dumps(focus),redaction_key)
+    cap=40000 if getattr(LOCAL,'wide_context',False) else 10000
+    key=(str(path),digest,side,json.dumps(focus),redaction_key,cap)
     hit=SOURCE_CACHE.get(key) if redaction_key is not None else None
     if hit: selected=hit[0]
     else:
-        text=scrub(decode(raw),sanitizer); selected=excerpt(text,focus)
+        text=scrub(decode(raw),sanitizer); selected=excerpt(text,focus,cap=cap)
         if redaction_key is not None: SOURCE_CACHE.put(key,selected)
     return {'path':Path(relative).as_posix(),'side':side,'sha256':digest,
             'bytes':len(raw), **selected}
@@ -285,7 +286,7 @@ def collect_review(arguments,sanitizer=lambda text:text):
             if not entries: raise ValueError('No readable source snapshot available.')
             item={'path':Path(relative).as_posix(),'text':diff[:12000],'truncated':len(diff)>12000} if diff else None
             tentative={**bundle,'snapshots':bundle['snapshots']+entries,'diffs':bundle['diffs']+([item] if item else [])}
-            if len(json.dumps(tentative,ensure_ascii=False))>MAX_BUNDLE_CHARS:
+            if len(json.dumps(tentative,ensure_ascii=False))>(200000 if getattr(LOCAL,'wide_context',False) else MAX_BUNDLE_CHARS):
                 raise ValueError('Context budget exhausted; narrow files or change scope.')
             bundle['snapshots']+=entries
             bundle['reviewed_paths'].append(Path(relative).as_posix())
@@ -346,7 +347,7 @@ def add_related(bundle,repo,requested_project,sanitizer):
                 if not contained(path,requested_project): continue
                 extra=snapshot(repo,name,sanitizer=sanitizer); extra['role']='related'
                 tentative={**bundle,'snapshots':bundle['snapshots']+[extra]}
-                if len(json.dumps(tentative,ensure_ascii=False))>MAX_BUNDLE_CHARS: continue
+                if len(json.dumps(tentative,ensure_ascii=False))>(200000 if getattr(LOCAL,'wide_context',False) else MAX_BUNDLE_CHARS): continue
                 bundle['snapshots'].append(extra); bundle['related_paths'].append(name); seen.add(name); count+=1
                 if extra['truncated']:
                     bundle['warnings'].append(f'Related source excerpt truncated: {name}')
@@ -371,14 +372,14 @@ def collect_failure(arguments,sanitizer=lambda text:text):
                            'include_related':arguments.get('include_related',True)},sanitizer)
     bundle['failure_log']={'path':logfile,'sha256':log_sha,'tail':log[-15000:], 'truncated':len(log)>15000}
     if len(log)>15000: bundle['warnings'].append('Failure log truncated to last 15000 characters.')
-    if len(json.dumps(bundle,ensure_ascii=False))>85000:
+    if len(json.dumps(bundle,ensure_ascii=False))>(215000 if getattr(LOCAL,'wide_context',False) else 85000):
         raise ValueError('Diagnostic context exceeds budget; reduce source files or log size.')
     return bundle
 
 
 def verify_snapshots(bundle):
     project=Path(bundle['project_root'])
-    states={'changed':[],'unreadable':[],'verification_timeout':[]}
+    states={'changed':[],'unreadable':[],'verification_timeout':[],'verification_cancelled':[]}
     for item in bundle['snapshots']:
         if item['side']!='after': continue
         # staged snapshots describe the index, not the working file.
@@ -390,11 +391,19 @@ def verify_snapshots(bundle):
                 raw=read_bytes(path)
             if hashlib.sha256(raw).hexdigest()!=item['sha256']: states['changed'].append(item['path'])
         except TimeoutError: states['verification_timeout'].append(item['path'])
+        except RuntimeError:
+            event=getattr(LOCAL,'cancelled',None)
+            if event is None or not event.is_set(): raise
+            states['verification_cancelled'].append(item['path'])
         except (ValueError,OSError) as exc: states['unreadable'].append({'path':item['path'],'reason':str(exc)})
     for relative in bundle.get('absent_after',[]):
         if bundle['scope']=='staged':
             try: git(project,['show',':'+relative]); states['changed'].append(relative)
             except TimeoutError: states['verification_timeout'].append(relative)
+            except RuntimeError:
+                event=getattr(LOCAL,'cancelled',None)
+                if event is None or not event.is_set(): raise
+                states['verification_cancelled'].append(relative)
             except ValueError: pass
         else:
             try:
@@ -403,6 +412,7 @@ def verify_snapshots(bundle):
             except (ValueError,OSError) as exc: states['unreadable'].append({'path':relative,'reason':str(exc)})
     states['changed']=sorted(set(states['changed']))
     states['verification_timeout']=sorted(set(states['verification_timeout']))
+    states['verification_cancelled']=sorted(set(states['verification_cancelled']))
     return states
 
 

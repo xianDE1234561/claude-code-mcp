@@ -13,9 +13,11 @@ import time
 from urllib.parse import urlsplit
 
 import review_workflow
+import chunk_review
 from windows_job import Job
 from workflow_progress import Progress
 from volatile_cache import REVIEW_CACHE
+from cli_stream import Observer,capture_directory
 
 ROOT = Path(__file__).resolve().parent
 MAX_PROMPT = 100000
@@ -62,14 +64,16 @@ def executable():
     raise ValueError('Native claude.exe not found; set CLAUDE_MCP_EXE to its absolute path.')
 
 
-def run_cli(args, prompt=None, timeout=15, cancelled=None):
+def run_cli(args, prompt=None, timeout=15, cancelled=None, on_event=None):
     env = dict(os.environ)
     env['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'] = '1'
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     # File-backed capture avoids Windows reader threads waiting on inherited
     # pipe handles after the primary process exits. Files are temporary only.
-    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+    with capture_directory() as directory:
+      with (Path(directory)/'input').open('w+b') as stdin, (Path(directory)/'output').open('w+b') as stdout, (Path(directory)/'error').open('w+b') as stderr, (Path(directory)/'output').open('rb') as observer_file:
         job=Job(); process=None
+        stream=Observer(on_event) if '--verbose' in args and 'stream-json' in args else None
         try:
             stdin.write(prompt.encode('utf-8') if prompt is not None else b''); stdin.seek(0)
             process=subprocess.Popen([executable(), *args],stdin=stdin,
@@ -78,16 +82,29 @@ def run_cli(args, prompt=None, timeout=15, cancelled=None):
             deadline=time.monotonic()+timeout
             if cancelled is not None and cancelled.is_set(): raise RuntimeError('Claude call cancelled.')
             while process.poll() is None:
+                if os.fstat(stdout.fileno()).st_size>2_000_000 or os.fstat(stderr.fileno()).st_size>200000:
+                    raise ValueError('CLI diagnostic/output exceeds capture limit.')
+                if stream: stream.feed(observer_file.read(65536))
                 if cancelled is not None and cancelled.is_set(): raise RuntimeError('Claude call cancelled.')
                 remaining=deadline-time.monotonic()
                 if remaining<=0: raise TimeoutError(f'Claude did not finish within {timeout} seconds.')
                 try: process.wait(timeout=min(.5,remaining))
                 except subprocess.TimeoutExpired: pass
             job.close()
+            if stream:
+                while chunk:=observer_file.read(65536): stream.feed(chunk)
+                stream.finish()
             stdout.seek(0); stderr.seek(0)
             out=stdout.read(2_000_001); err=stderr.read(200001)
             if len(out)>2_000_000 or len(err)>200000: raise ValueError('CLI diagnostic/output exceeds capture limit.')
+            if stream:
+                if stream.result is None: raise ValueError('CLI stream ended without a final result.')
+                final=dict(stream.result); final['_bridge_stream']=stream.summary()
+                out=json.dumps(final,ensure_ascii=False).encode('utf-8')
             return process.returncode,out.decode('utf-8',errors='replace'),err.decode('utf-8',errors='replace')
+        except (OSError,ValueError,RuntimeError,TimeoutError) as exc:
+            if stream is not None: exc.stream_diagnostics=stream.summary()
+            raise
         finally:
             job.close()
             if process is not None:
@@ -127,16 +144,17 @@ def model_options(arguments):
     return model,timeout
 
 
-def invoke(text,model,timeout,cancelled,system,schema=None):
+def invoke(text,model,timeout,cancelled,system,schema=None,on_event=None,stream_events=True):
     if len(text)>MAX_PROMPT:
         raise ValueError(f'Combined prompt/context limit: {MAX_PROMPT} characters.')
-    args=['-p','--output-format','json','--safe-mode','--disable-slash-commands','--tools','',
+    args=['-p','--output-format','stream-json' if stream_events else 'json','--safe-mode','--disable-slash-commands','--tools','',
           '--strict-mcp-config','--no-session-persistence','--permission-mode','dontAsk',
           '--system-prompt',system]
     if model: args.extend(['--model',model])
+    if stream_events: args.extend(['--verbose','--include-partial-messages'])
     if schema: args.extend(['--json-schema',json.dumps(schema,separators=(',',':'))])
     start=time.monotonic()
-    code,out,err=run_cli(args,text,timeout,cancelled)
+    code,out,err=run_cli(args,text,timeout,cancelled,on_event=on_event) if on_event else run_cli(args,text,timeout,cancelled)
     try: payload=json.loads(out)
     except ValueError:
         raise ValueError(f'Invalid CLI JSON (exit={code}): {out[-2000:]}\n{err[-2000:]}')
@@ -145,6 +163,7 @@ def invoke(text,model,timeout,cancelled,system,schema=None):
         raise RuntimeError(f'Claude request failed (exit={code}): {payload.get("result") or payload.get("errors") or err[-2000:]}')
     metadata={'elapsed_seconds':round(time.monotonic()-start,2),'models':list(payload.get('modelUsage',{})),
               'permission_denials':payload.get('permission_denials',[])}
+    if '_bridge_stream' in payload: metadata['stream']=payload['_bridge_stream']
     if isinstance(payload.get('usage'),dict): metadata['usage']=payload['usage']
     if isinstance(payload.get('total_cost_usd'),(int,float)):
         metadata['estimated_cost_usd']=payload['total_cost_usd']
@@ -162,7 +181,7 @@ def invoke(text,model,timeout,cancelled,system,schema=None):
 
 
 def ask(arguments, cancelled=None):
-    if not isinstance(arguments, dict) or set(arguments)-{'prompt','context','model','timeout_seconds'}:
+    if not isinstance(arguments, dict) or set(arguments)-{'prompt','context','model','timeout_seconds','stream_events'}:
         return result('Unknown arguments or invalid argument object.', True)
     prompt=arguments.get('prompt')
     context=arguments.get('context','')
@@ -173,8 +192,9 @@ def ask(arguments, cancelled=None):
     text=prompt if not context else f'Context supplied by caller:\n{context}\n\nTask:\n{prompt}'
     try:
         model,timeout=model_options(arguments)
+        if type(arguments.get('stream_events',True)) is not bool: raise ValueError('stream_events must be boolean.')
         answer,metadata=invoke(text,model,timeout,cancelled,
-            'You are an independent advisor. Answer using only the prompt and explicitly supplied context. You have no tools or access to workspace files. Do not claim to have executed commands or changed files.')
+            'You are an independent advisor. Answer using only the prompt and explicitly supplied context. You have no tools or access to workspace files. Do not claim to have executed commands or changed files.',stream_events=arguments.get('stream_events',True))
         return result_json({'answer':answer,**metadata})
     except (OSError,ValueError,RuntimeError,TimeoutError) as exc:
         return result(str(exc),True)
@@ -185,12 +205,18 @@ def workflow(mode,arguments,cancelled=None,on_progress=None):
     try:
         if not isinstance(arguments,dict): raise ValueError('arguments must be an object.')
         model,timeout=model_options(arguments)
-        with review_workflow.context.call_budget(timeout,cancelled,use_cache=arguments.get('use_cache',True)):
+        chunked=arguments.get('chunked',True)
+        if type(chunked) is not bool: raise ValueError('chunked must be boolean.')
+        with review_workflow.context.call_budget(timeout,cancelled,use_cache=arguments.get('use_cache',True),wide_context=chunked):
             progress.set('collect_context'); sanitizer=prepare_redactor()
             bundle=review_workflow.collect(mode,arguments,sanitizer)
             if mode=='review_diff' and not bundle.get('has_changes',True):
                 progress.set('no_changes'); output=review_workflow.no_changes(mode,bundle)
                 output['timing']=progress.summary(); return result_json(output)
+            if chunked:
+                output=run_chunks(mode,arguments,bundle,model,timeout,cancelled,progress,sanitizer)
+                progress.set('completed' if output['chunks']['complete'] else 'partial')
+                output['timing']=progress.summary(); return result_json(output,not bool(output['chunks']['completed']))
             text=review_workflow.prompt(mode,bundle)
             settings_stamps=[]
             for path in (Path.home()/'.claude/settings.json',Path.home()/'.claude.json'):
@@ -207,7 +233,8 @@ def workflow(mode,arguments,cancelled=None,on_progress=None):
             else:
                 progress.set('request_model')
                 remaining=review_workflow.context.budget_remaining(timeout)
-                report,metadata=invoke(text,model,remaining,cancelled,review_workflow.SYSTEM,review_workflow.SCHEMA)
+                progress.set('start_cli')
+                report,metadata=invoke(text,model,remaining,cancelled,review_workflow.SYSTEM,review_workflow.SCHEMA,on_event=progress.observe,stream_events=arguments.get('stream_events',True))
                 metadata.update({'model_called':True,'cache_hit':False})
             progress.set('validate_result')
             output=review_workflow.finish(mode,report,bundle,metadata)
@@ -217,8 +244,48 @@ def workflow(mode,arguments,cancelled=None,on_progress=None):
             return result_json(output)
     except (OSError,ValueError,RuntimeError,TimeoutError,subprocess.TimeoutExpired) as exc:
         phase=progress.stage; progress.set('failed')
-        return result_json({'workflow':mode,'error':str(exc),'failed_phase':phase,'timing':progress.summary()},True)
+        return result_json({'workflow':mode,'error':str(exc),'failed_phase':phase,
+            'stream':getattr(exc,'stream_diagnostics',None),'capture_cleanup_failed':getattr(exc,'capture_cleanup_failed',False),'timing':progress.summary()},True)
     finally: progress.close()
+
+
+def run_chunks(mode,arguments,bundle,model,timeout,cancelled,progress,sanitizer):
+    plan=chunk_review.plan(bundle,arguments.get('chunk_chars',18000),arguments.get('max_chunks',12))
+    completed=[]; failures=[]
+    stamps=[]
+    for path in (Path.home()/'.claude/settings.json',Path.home()/'.claude.json'):
+        try: stamps.append(path.stat().st_mtime_ns)
+        except OSError: stamps.append(None)
+    for index,chunk in enumerate(plan['chunks']):
+        text=review_workflow.prompt(mode,chunk)
+        key=hashlib.sha256(json.dumps([mode,text,model,review_workflow.SYSTEM,review_workflow.SCHEMA,
+            sanitizer.cache_key,stamps,os.environ.get('ANTHROPIC_MODEL'),os.environ.get('ANTHROPIC_BASE_URL'),
+            os.environ.get('CLAUDE_MCP_EXE'),arguments.get('stream_events',True)],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+        try:
+            remaining=review_workflow.context.budget_remaining(timeout)
+            hit=REVIEW_CACHE.get(key) if arguments.get('use_cache',True) else None
+            if hit:
+                progress.set('cache_hit'); (raw,original),age=hit
+                metadata={'model_called':False,'cache_hit':True,'cache_age_seconds':round(age,3),
+                          'estimated_cost_usd':0,'original_request':original}
+            else:
+                progress.set('request_model'); progress.set('start_cli')
+                raw,metadata=invoke(text,model,remaining,cancelled,review_workflow.SYSTEM,review_workflow.SCHEMA,
+                    on_event=progress.observe,stream_events=arguments.get('stream_events',True))
+                metadata.update({'model_called':True,'cache_hit':False})
+            progress.set('validate_result')
+            validated=review_workflow.validate_findings(raw,chunk,mode)
+            if not hit and arguments.get('use_cache',True) and validated['coverage']['complete'] and not validated['rejected_findings']:
+                REVIEW_CACHE.put(key,(raw,metadata))
+            completed.append((chunk,raw,metadata))
+        except (OSError,ValueError,RuntimeError,TimeoutError,subprocess.TimeoutExpired) as exc:
+            failures.append({'id':chunk['chunk']['id'],'focus':chunk['chunk']['focus'],'focuses':chunk['chunk']['focuses'],'reason':type(exc).__name__,
+                'failed_phase':progress.stage,'error':str(exc),'stream':getattr(exc,'stream_diagnostics',None),
+                'capture_cleanup_failed':getattr(exc,'capture_cleanup_failed',False)})
+            if isinstance(exc,(TimeoutError,subprocess.TimeoutExpired)) or (cancelled and cancelled.is_set()):
+                failures.extend({'id':other['chunk']['id'],'focus':other['chunk']['focus'],'focuses':other['chunk']['focuses'],'reason':'global deadline or cancellation'} for other in plan['chunks'][index+1:])
+                break
+    return chunk_review.aggregate(mode,bundle,plan,completed,failures)
 
 
 def status(arguments, cancelled=None):
@@ -253,7 +320,7 @@ TOOLS=[
      'inputSchema':{'type':'object','properties':{'live_probe':{'type':'boolean','default':False}},'additionalProperties':False},
      'annotations':{'readOnlyHint':True,'destructiveHint':False,'openWorldHint':True}},
     {'name':'ask_claude','description':'Ask local Claude Code for an independent answer, code review, or analysis. Supply all relevant context explicitly. No built-in tools, filesystem access, shell, nested MCP, or shared conversation. Uses the existing Claude provider and credentials; consumes provider usage.',
-     'inputSchema':{'type':'object','properties':{'prompt':{'type':'string','minLength':1,'maxLength':MAX_PROMPT},'context':{'type':'string','maxLength':MAX_PROMPT},'model':{'type':'string','maxLength':160},'timeout_seconds':{'type':'integer','minimum':10,'maximum':600,'default':180}},'required':['prompt'],'additionalProperties':False},
+     'inputSchema':{'type':'object','properties':{'prompt':{'type':'string','minLength':1,'maxLength':MAX_PROMPT},'context':{'type':'string','maxLength':MAX_PROMPT},'model':{'type':'string','maxLength':160},'stream_events':{'type':'boolean','default':True},'timeout_seconds':{'type':'integer','minimum':10,'maximum':600,'default':180}},'required':['prompt'],'additionalProperties':False},
      'annotations':{'readOnlyHint':True,'destructiveHint':False,'openWorldHint':True}},
 ]
 
@@ -266,6 +333,10 @@ COMMON_WORKFLOW_PROPERTIES={
     'timeout_seconds':{'type':'integer','minimum':10,'maximum':600,'default':180},
     'include_related':{'type':'boolean','default':True,'description':'Read at most four relevant local imports/tests under the same project root.'},
     'use_cache':{'type':'boolean','default':True,'description':'Reuse a complete matching review for up to five minutes within this server process; false forces a fresh model request.'},
+    'stream_events':{'type':'boolean','default':True,'description':'Observe only filtered CLI lifecycle/retry/activity events; false uses legacy final JSON.'},
+    'chunked':{'type':'boolean','default':True,'description':'Review bounded module/file windows sequentially under one total deadline.'},
+    'chunk_chars':{'type':'integer','minimum':6000,'maximum':30000,'default':18000},
+    'max_chunks':{'type':'integer','minimum':1,'maximum':12,'default':12},
 }
 TOOLS.extend([
     {'name':'review_diff','description':'Independently review Git changes or explicit files using bounded automatic source snapshots, line numbers and SHA-256 hashes. Returns structured findings with locally checked evidence, partial coverage and stale-source warnings. No code execution or edits. Consumes Claude provider usage.',
@@ -335,7 +406,7 @@ def main():
                     offered=params.get('protocolVersion')
                     version=offered if offered in ('2024-11-05','2025-03-26','2025-06-18','2025-11-25') else '2025-06-18'
                     reply(rid,{'protocolVersion':version,'capabilities':{'tools':{'listChanged':False}},
-                        'serverInfo':{'name':'claude-code-bridge','version':'3.0.0'},
+                        'serverInfo':{'name':'claude-code-bridge','version':'4.0.0'},
                         'instructions':'Use review_diff for code review and diagnose_failure for logs. findings are candidates, not confirmed defects; suggestions are optional. Check freshness, coverage, behavior evidence and verification_steps before reproducing and fixing. Provide requirements and narrow files. Progress/timing identify the current stage; no_changes never calls a model. use_cache=false requests a fresh review. Claude cannot run tests or edit files. Default to two review rounds; only one call runs at a time.'})
                 elif method=='ping': reply(rid,{})
                 elif method=='tools/list': reply(rid,{'tools':TOOLS})

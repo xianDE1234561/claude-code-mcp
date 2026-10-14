@@ -1,0 +1,50 @@
+[
+  {
+    "id": "missing_empty_guard",
+    "file": "mean.py",
+    "source": "def mean(values):\n    return sum(values) / len(values)\n",
+    "requirements": "验收 mean([2,4]) 返回 3；mean([]) 必须抛出 ValueError。其他输入不在本次契约范围内。",
+    "oracle": "from mean import mean\nassert mean([2,4]) == 3\ntry:\n    mean([])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('empty input must raise ValueError')\n",
+    "defect": true,
+    "defect_lines": [2],
+    "trigger_needles": ["mean([])", "空列表", "empty"],
+    "actual_needles": ["ZeroDivisionError", "零", "zero"],
+    "expected_needles": ["ValueError"]
+  },
+  {
+    "id": "last_index_off_by_one",
+    "file": "last.py",
+    "source": "def last(items):\n    return items[len(items)]\n",
+    "requirements": "仅验收 last([10,20]) 返回 20；last([7]) 返回 7。空列表和其他输入不在本次契约范围内。",
+    "oracle": "from last import last\nassert last([10,20]) == 20\nassert last([7]) == 7\n",
+    "defect": true,
+    "defect_lines": [2],
+    "trigger_needles": ["last(", "非空", "non-empty", "nonempty"],
+    "actual_needles": ["IndexError", "越界", "out of range"],
+    "expected_needles": ["20", "7", "最后", "last"]
+  },
+  {
+    "id": "correct_empty_guard",
+    "file": "mean.py",
+    "source": "def mean(values):\n    if not values:\n        raise ValueError('empty')\n    return sum(values) / len(values)\n",
+    "requirements": "验收 mean([2,4]) 返回 3；mean([]) 必须抛出 ValueError。其他输入不在本次契约范围内。",
+    "oracle": "from mean import mean\nassert mean([2,4]) == 3\ntry:\n    mean([])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('empty input must raise ValueError')\n",
+    "defect": false,
+    "defect_lines": [],
+    "trigger_needles": [],
+    "actual_needles": [],
+    "expected_needles": []
+  },
+  {
+    "id": "sparse_docs_are_advisory",
+    "file": "average.py",
+    "source": "def average(xs):\n    return sum(xs)/len(xs)\n",
+    "requirements": "仅验收 average([2,4]) 返回 3；average([1]) 返回 1。输入限定为这两个非空列表，不承诺空列表、None或其他类型。缺少文档、空格格式或额外测试可以提建议，不能当作已证实行为缺陷，也不能从所给文件推断项目没有测试。",
+    "oracle": "from average import average\nassert average([2,4]) == 3\nassert average([1]) == 1\n",
+    "defect": false,
+    "defect_lines": [],
+    "trigger_needles": [],
+    "actual_needles": [],
+    "expected_needles": []
+  }
+]

@@ -1,5 +1,7 @@
 # Claude Code MCP for Codex
 
+当前版本：v4。提供经过过滤的真实 CLI 流式状态、有界分块审查，以及区分离线标准答案检查和真实模型测量的质量基线。
+
 将本机 Claude Code CLI 封装为 STDIO MCP。Codex 负责实现、核实、修复和测试，Claude 根据明确提供的材料做独立审查或失败分析。
 
 ## 运行条件与安装
@@ -54,7 +56,11 @@ Claude 无文件、终端或嵌套 MCP 工具；失败命令只作为文本，�
   "requirements": "实际需求及可检验的验收条件",
   "timeout_seconds": 180,
   "include_related": true,
-  "use_cache": true
+  "use_cache": true,
+  "stream_events": true,
+  "chunked": true,
+  "chunk_chars": 18000,
+  "max_chunks": 12
 }
 ```
 
@@ -71,6 +77,19 @@ Claude 无文件、终端或嵌套 MCP 工具；失败命令只作为文本，�
 - `hypotheses` 仅用于诊断，必须匹配所给日志；`tests_to_run` 是建议，未实际执行。
 - 检查 `coverage` 的跳过项、截断和引用行范围。`coverage.complete` 只表示所选材料的收集覆盖，不能证明整个项目正确。
 - `freshness.changed`、`freshness.unreadable`、`freshness.verification_timeout` 分别表示变化、读取失败、复核超时；后两者不被冒充为文件已变化。`freshness_verified=false` 时先解决复核问题。
+- `freshness.verification_cancelled` 表示复核被取消。`chunks.results` 列出已完成块及准确审查范围，`chunks.unreviewed` 列出未完成或预算未覆盖范围。工具成功仍可能是部分结果；同时检查 `chunks.complete`、`coverage.complete` 和新鲜度。完成块的意见继续是候选缺陷。
+
+## v4 流式状态与分块
+
+连接保活事件单独分类为 `transport_keepalive`，不计作模型输出；只有已识别的文本、思考或结构化JSON增量，以及实际助手消息计作输出活动，且仅报告类别与计数。
+
+默认读取 CLI 的 `stream-json`，转发白名单状态：初始化、有限的重试次数/HTTP 状态/错误类别、输出活动及最终结果是否收到。进度中不传原始事件、文字、思考内容、会话ID或目录。没有输出活动不代表请求一定卡死；需要结合初始化、重试事件和最终结果判断。`stream_events=false` 保留最终 JSON 模式。CLI 必须支持 `--verbose` 和 `--include-partial-messages`；不自动改变认证方式。
+
+分块模式先在内存收集最多 200,000 字符上下文（诊断含日志最多 215,000），单文件摘录最多 40,000 字符，再按模块声明或连续行窗口分配请求。每块 JSON 材料最多 `chunk_chars` 字符（默认18,000），最多12块；小源码与同目录 `test_<module>` 测试能放下时合并。仍限制24文件、每文件1 MB。旧单次模式 `chunked=false` 保留原70,000字符包和10,000字符摘录限制。
+
+各块串行共享总截止；已完成结果会在后续超时或取消后保留。每条意见先对产生它的块验证，再汇总去重。超过块数、材料/结果预算和失败块均明确报告。前后版本行号对应可能因编辑移位，跨块交互也不是穷尽审查。分块主要限制单次材料和保留部分结果，不能保证总耗时降低；避免将小任务拆成大量调用。
+
+CLI临时捕获及流式事件都有大小上限；事件摘要最多120项，进度阶段记录最多256项。Windows清理短暂文件占用时有限重试；持久失败会标记 `capture_cleanup_failed`，保留原错误。输出活动可以包含思考阶段的事件，但不转发其内容。
 
 默认流程：Codex 实现和初测 → Claude 审查 → Codex 核实候选意见 → 修复与复测。通常最多两轮审查；已有失败证据时使用诊断工具。技能详见 [SKILL.md](skill/codex-claude-review/SKILL.md)。
 
@@ -87,9 +106,23 @@ CLI/Git 的输入和输出用临时文件捕获，关闭后删除，避免 Windo
 ## 验证
 
 ```powershell
-python -m unittest -v test_bridge.py test_workflow.py test_client.py test_utilities.py test_setup.py
+python -m unittest -v test_bridge.py test_workflow.py test_client.py test_utilities.py test_setup.py test_stream.py test_chunks.py test_quality.py
 ```
 
 CI 在 Windows 上运行离线单元与故障模拟测试，不需要服务密钥，不请求模型。覆盖总截止与取消、初始化清理、stderr 排空、路径限制、证据过滤、缓存/进度、Git 新仓库及新鲜度分类。符号链接测试会在缺少 Windows 权限时明确跳过。
 
 本机另做过真实 MCP 验收：合成回归样例审查、缓存命中、失败诊断、Codex 修复后原测试通过、无改动跳过模型。仓库不包含那次运行结果或个人配置。实际延迟由模型服务决定，环境网络限制不能直接归因于服务故障。
+
+质量基线包含2个可复现缺陷、1个正确实现和1个文档/未知输入误报陷阱。检查已知答案不请求模型：
+
+```powershell
+python quality_eval.py
+```
+
+实际测量需本机MCP配置及已有认证，会消耗服务用量：
+
+```powershell
+python quality_eval.py --live --timeout 150 --output local-quality.json
+```
+
+报告包含逐案例完整/失败状态、候选缺陷匹配、漏报、正常案例误报、证据有效率和耗时；失败或部分案例不会悄悄当作正确结果。只针对明确的有限输入契约计算匹配，样本较少，不能泛化成项目准确率。原始结果保留在本机。测量方法见 [quality_cases/README.md](quality_cases/README.md)。

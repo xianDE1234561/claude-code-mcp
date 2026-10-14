@@ -157,15 +157,17 @@ def validate_findings(report,bundle,mode):
 
 
 def collect(mode,arguments,sanitizer):
-    common={'project_root','files','requirements','model','timeout_seconds','include_related','use_cache'}
+    common={'project_root','files','requirements','model','timeout_seconds','include_related','use_cache','stream_events','chunked','chunk_chars','max_chunks'}
     extra={'scope','base_ref'} if mode=='review_diff' else {'log','log_file','command'}
     if not isinstance(arguments,dict) or set(arguments)-(common|extra):
         raise ValueError('Invalid workflow argument object or unknown arguments.')
     for key in ('requirements','command'):
         if key in arguments and (not isinstance(arguments[key],str) or len(arguments[key])>10000):
             raise ValueError(f'{key} must be text at most 10000 characters.')
-    for key in ('include_related','use_cache'):
+    for key in ('include_related','use_cache','stream_events','chunked'):
         if key in arguments and type(arguments[key]) is not bool: raise ValueError(f'{key} must be boolean.')
+    for key,low,high in [('chunk_chars',6000,30000),('max_chunks',1,12)]:
+        if key in arguments and (type(arguments[key]) is not int or not low<=arguments[key]<=high): raise ValueError(f'{key} outside allowed integer range.')
     bundle=context.collect_review(arguments,sanitizer) if mode=='review_diff' else context.collect_failure(arguments,sanitizer)
     if not bundle['snapshots'] and bundle.get('has_changes',True):
         raise ValueError('No source snapshots collected. Narrow scope/use files mode and inspect excluded paths.')
@@ -187,6 +189,7 @@ def finish(mode,report,bundle,metadata):
         if stale: validated['coverage']['warnings'].append('Source changed while Claude was reviewing; recollect before applying advice.')
         if freshness['unreadable']: validated['coverage']['warnings'].append('Some source files could not be read for freshness verification.')
         if freshness['verification_timeout']: validated['coverage']['warnings'].append('Freshness verification exceeded the deadline; change status is unknown.')
+        if freshness.get('verification_cancelled'): validated['coverage']['warnings'].append('Freshness verification cancelled; change status is unknown.')
     return {'workflow':mode,**validated,'stale_files':stale,'freshness':freshness,'freshness_verified':not any(freshness.values()),'request':metadata,
             'context':{k:bundle.get(k) for k in ('project_root','requested_project_root','scope','base_commit','base_tree','reviewed_paths','related_paths')},
             'verification_note':'Locations and quotes are checked against supplied snapshots. Semantic correctness still requires Codex verification and tests.'}

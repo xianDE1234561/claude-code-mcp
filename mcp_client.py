@@ -41,7 +41,7 @@ class Client:
             self.reader=threading.Thread(target=read,daemon=True); self.reader.start()
             self.stderr_reader=threading.Thread(target=drain_stderr,daemon=True); self.stderr_reader.start()
             self.initialize=self.request('initialize',{'protocolVersion':'2025-06-18','capabilities':{},
-                'clientInfo':{'name':'claude-workflow-client','version':'3.0.0'}},startup_timeout)
+                'clientInfo':{'name':'claude-workflow-client','version':'4.0.0'}},startup_timeout)
             self.notify('notifications/initialized',{})
         except BaseException:
             self.close()
