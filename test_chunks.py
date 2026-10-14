@@ -83,5 +83,18 @@ class ChunkTests(unittest.TestCase):
         self.assertEqual(value['chunks']['completed'],1); self.assertTrue(value['findings'])
         self.assertFalse(value['freshness_verified']); self.assertIn('calc.py',value['freshness']['verification_cancelled'])
 
+    def test_test_first_packing_preserves_all_large_source_windows(self):
+        (self.root/'test_calc.py').write_text('from calc import mean\n',encoding='utf-8')
+        (self.root/'calc.py').write_text('\n'.join(f'value_{i} = {i}' for i in range(700)),encoding='utf-8')
+        with context.call_budget(10,wide_context=True):
+            bundle=context.collect_review(self.args(files=['test_calc.py','calc.py']))
+        plan=chunks.plan(bundle)
+        seen=[]
+        for chunk in plan['chunks']:
+            keys=[(s['path'],s['side']) for s in chunk['snapshots']]
+            self.assertEqual(len(keys),len(set(keys)))
+            seen.extend(n for s in chunk['snapshots'] if s['path']=='calc.py' for n,_ in chunks.numbers(s))
+        self.assertEqual(sorted(seen),list(range(1,701)))
+
 
 if __name__=='__main__': unittest.main()

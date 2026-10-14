@@ -83,7 +83,13 @@ def plan(bundle,chunk_chars=18000,max_chunks=12):
             unique={}
             for snap in candidate['snapshots']+item['snapshots']:
                 if snap.get('role')=='related' and snap['path'] in primary_names: continue
-                unique[(snap['path'],snap['side'],snap['text'])]=snap
+                key=(snap['path'],snap['side'])
+                if key in unique:
+                    previous=unique[key]
+                    if previous['sha256']!=snap['sha256']: raise ValueError('Conflicting snapshot hashes in a chunk.')
+                    rows=dict(numbers(previous)); rows.update(dict(numbers(snap)))
+                    unique[key]=slice_snapshot(previous,sorted(rows.items()))
+                else: unique[key]=snap
             candidate['snapshots']=list(unique.values())
             candidate['related_paths']=sorted({s['path'] for s in candidate['snapshots'] if s.get('role')=='related'})
             if len(json.dumps(candidate,ensure_ascii=False))<=chunk_chars:
