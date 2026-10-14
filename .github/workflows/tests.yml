@@ -1,0 +1,16 @@
+name: Offline tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest -v test_bridge.py test_workflow.py test_client.py test_utilities.py test_setup.py
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8

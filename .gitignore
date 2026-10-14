@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tmp/
+test-artifacts/
+backups/
+*.log
+*.bak
+.env*
+local-*.json
+generated-config.toml
+config.toml
+!examples/config.toml

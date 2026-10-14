@@ -1,0 +1,13 @@
+# Replace placeholders locally; keep the completed configuration private.
+[mcp_servers.claude_cli]
+command = '<absolute-path-to-python.exe>'
+args = ['<absolute-path-to-bridge.py>']
+cwd = '<absolute-repository-directory>'
+startup_timeout_sec = 10
+tool_timeout_sec = 660
+enabled = true
+
+[mcp_servers.claude_cli.env]
+PYTHONIOENCODING = 'utf-8'
+CLAUDE_MCP_EXE = '<absolute-path-to-claude.exe>'
+CLAUDE_MCP_ALLOWED_ROOTS = '["<absolute-project-directory>"]'
